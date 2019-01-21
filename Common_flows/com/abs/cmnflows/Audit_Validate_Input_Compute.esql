@@ -1,0 +1,188 @@
+/*-----------------------------------------------------------------------------
+SUBFLOW NAME: MsgLogSubFlow.subflow
+DESCRIPTION	: This is a common flow to all the flows for capturing Audit 
+			messages and store into a common queue. 
+AUTHOR		: TCS
+CREATED DT	: 12/06/2017
+-------------------------------------------------------------------------------
+Program History
+Project	Release	Version	ChangeOwner	Date		Description
+------  ------  ------	----------- ----------  -----------
+EDIS    Drop2	0.1		Spandana	12/06/2017	Initial Draft
+-----------------------------------------------------------------------------*/
+BROKER SCHEMA com.abs.cmnflows
+DECLARE MSG_LOG_CMPNT_INFO_CACHE SHARED ROW;
+CREATE COMPUTE MODULE Audit_Validate_Input_Compute
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		
+		DECLARE dotPosition INTEGER;
+		-- Strip schema from MessageFlowLabel to give FlowName		
+		SET dotPosition = POSITION('.' IN MessageFlowLabel REPEAT -1);	
+		-- Saving the FlowName in Environment variable		
+		SET Environment.Variables.compName = Substring(MessageFlowLabel FROM (dotPosition + 1) FOR length(MessageFlowLabel));
+		
+		--select component record into a shared row with the flow name
+		IF NOT EXISTS(MSG_LOG_CMPNT_INFO_CACHE.COMPONENT_RECORD[]) THEN
+			--Read_oracle starts from here 
+			READ_ORACLE : BEGIN
+				ATOMIC
+					SET MSG_LOG_CMPNT_INFO_CACHE.COMPONENT_RECORD[]= 
+							PASSTHRU('SELECT C.APPLICATION_NAME,
+											C.APPLICATION_DESC,
+											C.COMPONENT_ID,
+											C.COMPONENT_DESC,
+											C.COMPONENT_NAME,
+											C.COMPONENT_TYPE,
+											C.BO_NAME,
+											C.COMPONENT_INPUT_TYPE,
+											C.COMPONENT_INPUT_NAME,
+											C.SOURCE_SYSTEM_NAME,
+											C.AUDIT_REQD,
+											C.AUDIT_SRC_UNQ_ID,
+											C.PATH_SRC_UNQ_ID,
+											C.AUDIT_TRGT_UNQ_ID,
+											C.PATH_TRGT_UNQ_ID,
+											C.VALIDATION_REQD_SOURCE,
+											C.VALIDATION_REQD_TARGET,
+											C.STORE_SRC_MSG,
+											C.STORE_TRGT_MSG
+											FROM MSGLOG.EDIS_COMPONENTS C WHERE 
+											C.COMPONENT_NAME=?',
+											Environment.Variables.compName);
+					IF SQLCODE <> 0 THEN
+						THROW USER EXCEPTION VALUES
+						('DBERROR: EXC001',
+						 'FAILED TO SELECT COMPONENT DETAILS FROM EDIS_COMPONENTS TABLE',
+						 'Flow Name = ' || Environment.Variables.FlowName);
+					END IF;
+			END READ_ORACLE ;	
+			--read oracle bloc ends here 											
+		END IF;
+		
+		--Store the component record into environment varaibles
+		SET Environment.Variables.CMPNT = THE(SELECT C.APPLICATION_NAME,
+											C.APPLICATION_DESC,
+											C.COMPONENT_ID,
+											C.COMPONENT_DESC,
+											C.COMPONENT_NAME,
+											C.COMPONENT_TYPE,
+											C.BO_NAME,
+											C.COMPONENT_INPUT_TYPE,
+											C.COMPONENT_INPUT_NAME,
+											C.SOURCE_SYSTEM_NAME,
+											C.AUDIT_REQD,
+											C.AUDIT_SRC_UNQ_ID,
+											C.PATH_SRC_UNQ_ID,
+											C.AUDIT_TRGT_UNQ_ID,
+											C.PATH_TRGT_UNQ_ID,
+											C.VALIDATION_REQD_SOURCE,
+											C.VALIDATION_REQD_TARGET,
+											C.STORE_SRC_MSG,
+											C.STORE_TRGT_MSG
+											FROM 
+									MSG_LOG_CMPNT_INFO_CACHE.COMPONENT_RECORD[]
+											AS C);
+		--exception when no component table entry is found.															
+		IF NOT EXISTS(Environment.Variables.CMPNT[]) THEN
+			THROW USER EXCEPTION VALUES
+			('DBERROR: EXC002','NO ROWS RETURNED IN SELECT FROM IH_COMPONENTS',
+			 'Flow Name = ' || Environment.Variables.FlowName);
+		 END IF;	
+		--Reference to environment component table details
+		DECLARE cmpRef REFERENCE TO Environment.Variables.CMPNT;
+		
+		--Check for flow type and throw exception if invalid
+		IF cmpRef.COMPONENT_TYPE NOT IN('PP','PF','CF','HF','SF') THEN
+				--exception when an invalid flow type is specified 
+				THROW USER EXCEPTION VALUES
+				('DBERROR: EXC003','FAILED: INVALID FLOW_TYPE',
+				 'Flow Name = ' || cmpRef.COMPONENT_NAME,
+				'Flow Type = ' || cmpRef.COMPONENT_TYPE);
+		END IF;
+    
+	/*-----------------------------------------------------------------------
+		   Input Audit logic starts from here 
+	------------------------------------------------------------------------- */
+		/* environment varaible to store msg log information and pass as 
+			parameter to createMsgLog procedure */	  
+		CREATE FIELD Environment.Variables.msgLogInfo;
+		DECLARE msgLogTemp REFERENCE TO Environment.Variables.msgLogInfo;
+		
+		--Condition to check if audit required flag is enabled for the flow
+		IF UPPER(cmpRef.AUDIT_REQD) = 'Y' THEN 
+			CREATE FIELD OutputRoot.XMLNSC;
+			SET msgLogTemp.DIRECTION = 'Input' ;
+			
+			-- Mapping for TransactionId   	
+			IF cmpRef.COMPONENT_TYPE = 'SF' AND 
+					EXISTS(InputRoot.HTTPInputHeader[]) THEN
+				SET msgLogTemp.TransactionId = 
+					TRIM(InputLocalEnvironment.Destination.SOAP.Reply.ReplyIdentifier);
+				--Store in Environment variabl for output Audit
+				SET Environment.Variables.SoapReplyIdentifier =
+					TRIM(InputLocalEnvironment.Destination.SOAP.Reply.ReplyIdentifier);
+			ELSEIF cmpRef.COMPONENT_TYPE = 'HF' AND 
+				   EXISTS (InputRoot.HTTPInputHeader[]) THEN
+				SET msgLogTemp.TransactionId = 
+					TRIM(InputLocalEnvironment.Destination.HTTP.RequestIdentifier);
+				--Store in Environment variabl for output Audit
+				SET Environment.Variables.HttpReqIdentifier = 
+					TRIM(InputLocalEnvironment.Destination.HTTP.RequestIdentifier);
+			ELSE 
+		   	   SET msgLogTemp.TransactionId = 
+					COALESCE(InputRoot.MQMD.MsgId,
+							InputLocalEnvironment.Destination.HTTP.ReplyIdentifier,
+					CAST(SUBSTRING(CAST(CURRENT_TIMESTAMP AS CHARACTER)FROM 4)AS BLOB CCSID 1208));
+			END IF;
+			
+			--to capture source unique id
+			IF UPPER(cmpRef.AUDIT_SRC_UNQ_ID) = 'Y' THEN
+		 	   SET msgLogTemp.MsgUnqId = 
+					COALESCE(EVAL(cmpRef.PATH_SRC_UNQ_ID),
+								  'Invalid XPath in PATH_SRC_UNQ_ID');
+			END IF;
+			
+			--to capture source message
+			IF UPPER(cmpRef.STORE_SRC_MSG) = 'Y' THEN
+		 	   SET msgLogTemp.storeMsg = 'Y';
+			END IF;
+			
+			/* Function to create Audit message. 
+			This is common for both Input and output audit */ 
+			CALL createMsgLog(InputRoot,OutputRoot,Environment);
+			--Propogate the audit message to EDIS_MSG_LOG queue
+			PROPAGATE TO TERMINAL 'out1' DELETE NONE ;
+		END IF;
+		
+		DELETE FIELD Environment.Variables.msgLogInfo; 
+	    CALL CopyEntireMessage();
+	   
+	    /* Route to validate node if validation is 
+	    required else route to output node */
+	    IF UPPER(cmpRef.VALIDATION_REQD_SOURCE) = 'Y' THEN
+			PROPAGATE TO TERMINAL 'out2' DELETE NONE ;
+	    ELSE
+			PROPAGATE TO TERMINAL 'out' DELETE NONE ;
+	    END IF;	
+		
+		RETURN FALSE;
+	END;
+    
+    CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+	
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+	
+END MODULE;
+
+
